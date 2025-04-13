@@ -6,6 +6,11 @@
 #include <Server_Side_RPC.h>
 #include <ThingsBoard.h>
 #include <Shared_Attribute_Update.h>
+#include <Attribute_Request.h>
+#include <OTA_Firmware_Update.h>
+#include <Preferences.h>
+#include <Espressif_Updater.h>
+#include "esp_ota_ops.h"
 #include "DHT20.h"
 #include "DHT.h"
 
@@ -17,6 +22,8 @@ DHT dht(DHTPIN, DHTTYPE);
 // use to connect wifi
 const char WIFI_SSID[] = "Cutom 2.4Ghz";
 const char WIFI_PASSWORD[] = "Cutom0104";
+// const char WIFI_SSID[] = "Hoang";
+// const char WIFI_PASSWORD[] = "15220903";
 
 // use to connect thingsboard
 const char THINGSBOARD_SERVER[] = "app.coreiot.io";
@@ -26,7 +33,7 @@ const char TOKEN[] = "q8hm31kl8fvuv1vhzbzr";
 // define max size of the message
 const uint32_t MAX_MESSAGE_SIZE = 1024;
 
-// parameter to subscribe shared attribute
+// SHARED ATTRIBUTE
 // declare function
 void processSharedAttributeUpdate(const JsonObjectConst &data);
 
@@ -34,10 +41,19 @@ constexpr uint8_t MAX_SHARED_ATTR = 5U;
 Shared_Attribute_Update<1U, MAX_SHARED_ATTR> sharedAttributeUpdate;
 
 const char ledState[] = "turnOn";
-constexpr std::array<const char *, 1U> SUBSCRIBED_SHARED_ATTRIBUTES = {ledState};
+constexpr std::array<const char *, 2U> SUBSCRIBED_SHARED_ATTRIBUTES = {ledState};
 const Shared_Attribute_Callback<MAX_SHARED_ATTR> callback(&processSharedAttributeUpdate, SUBSCRIBED_SHARED_ATTRIBUTES);
 
-// RPC callback
+// REQUEST ATTRIBUTE
+const char fwVersion[] = "fw_version";
+uint64_t REQUEST_TIMEOUT_MICROSECONDS = 5000000ULL;
+void requestTimedOut() {}
+
+const std::vector<const char *> REQUESTED_CLIENT_ATTRIBUTES = {fwVersion};
+Attribute_Request<2U, 5U> attr_request;
+const Attribute_Request_Callback<5U> clientCallback(&processSharedAttributeUpdate, REQUEST_TIMEOUT_MICROSECONDS, &requestTimedOut, REQUESTED_CLIENT_ATTRIBUTES);
+
+// RPC CALLBACK
 void processGetValidationVal(const JsonVariantConst &data, JsonDocument &response);
 
 const char RPC_TRUE_METHOD[] = "rpcTrueCommand";
@@ -52,10 +68,31 @@ const std::array<RPC_Callback, 2U> RPCcallbacks = {
     RPC_Callback{RPC_FALSE_METHOD, processGetValidationVal},
 };
 
-const std::array<IAPI_Implementation *, 2U> apis = {
+// OTA UPDATE
+void update_starting_callback();
+void finished_callback(const bool &success);
+void progress_callback(const size_t &current, const size_t &total);
+
+Espressif_Updater<> updater;
+
+const char CURRENT_FIRMWARE_TITLE[] = "OTA for ESP32";
+char CURRENT_FIRMWARE_VERSION[32];
+char LASTEST_FIRMWARE_VERSION[32];
+
+// Maximum amount of retries we attempt to download each firmware chunck over MQTT
+constexpr uint8_t FIRMWARE_FAILURE_RETRIES = 12U;
+// Size of each firmware chunck downloaded over MQTT,
+constexpr uint16_t FIRMWARE_PACKET_SIZE = 4096U;
+
+OTA_Firmware_Update<> ota;
+
+const std::array<IAPI_Implementation *, 4U> apis = {
     &sharedAttributeUpdate,
     &rpc,
+    &ota,
+    &attr_request,
 };
+
 // define object instantiation to communicate with thingsboar server
 WiFiClient wifiClient;
 Arduino_MQTT_Client mqttClient(wifiClient);
@@ -64,6 +101,27 @@ ThingsBoard thingsBoard(mqttClient, MAX_MESSAGE_SIZE, MAX_MESSAGE_SIZE, Default_
 DHT20 dht20;
 bool sharedAttrSubscribed = false;
 bool RPCSubscribed = false;
+bool currentFWSent = false;
+bool updateRequestSent = false;
+bool requestedShared = false;
+/* -----------------------------------------------HELPER FUNCTION-------------------------------------------- */
+Preferences prefs;
+
+void readVersion()
+{
+  prefs.begin("firmware", true); // true = read-only
+  String version = prefs.getString("version", "unknown").c_str();
+  strncpy(CURRENT_FIRMWARE_VERSION, version.c_str(), sizeof(CURRENT_FIRMWARE_VERSION));
+  CURRENT_FIRMWARE_VERSION[strlen(CURRENT_FIRMWARE_VERSION) + 1] = '\0';
+  prefs.end();
+}
+
+void writeVersion()
+{
+  prefs.begin("firmware", false); // false = read+write
+  prefs.putString("version", String(LASTEST_FIRMWARE_VERSION));
+  prefs.end();
+}
 
 void initWifi()
 {
@@ -79,6 +137,8 @@ void initWifi()
   Serial.println();
   Serial.println("Connected to Access Point");
 }
+
+/* ----------------------------------------------TASKS-------------------------------------------------------- */
 
 void taskReconnectWifi(void *pvParameters)
 {
@@ -114,6 +174,20 @@ void taskConnectCoreIoT(void *pvParameters)
     }
     else
       Serial.println("CoreIoT already connected");
+
+    if (!currentFWSent)
+    {
+      currentFWSent = ota.Firmware_Send_Info(CURRENT_FIRMWARE_TITLE, CURRENT_FIRMWARE_VERSION);
+    }
+
+    if (!updateRequestSent)
+    {
+      Serial.println("Firwmare Update");
+      Serial.print("Current Firmware Version: ");
+      Serial.println(CURRENT_FIRMWARE_VERSION);
+      const OTA_Update_Callback callback(CURRENT_FIRMWARE_TITLE, CURRENT_FIRMWARE_VERSION, &updater, &finished_callback, &progress_callback, &update_starting_callback, FIRMWARE_FAILURE_RETRIES, FIRMWARE_PACKET_SIZE);
+      updateRequestSent = ota.Start_Firmware_Update(callback);
+    }
     vTaskDelay(8000 / portTICK_PERIOD_MS);
   }
 }
@@ -132,6 +206,16 @@ void taskSubSharedAttr(void *pvParameters)
       }
       Serial.println("Subscribe shared attribute done");
       sharedAttrSubscribed = true;
+    }
+
+    if (!requestedShared)
+    {
+      // Shared attributes we want to request from the server
+      requestedShared = attr_request.Shared_Attributes_Request(clientCallback);
+      if (!requestedShared)
+      {
+        Serial.println("Failed to request shared attributes");
+      }
     }
     vTaskDelay(9000 / portTICK_PERIOD_MS);
   }
@@ -158,68 +242,11 @@ void taskSubRPCCallback(void *pvParameters)
   }
 }
 
-// void readSensor(void* pvParameters){
-//   (void)pvParameters;
-//   while(true){
-//     dht20.read();
-
-//     // float temperature = dht20.getTemperature();
-//     // float humidity = dht20.getHumidity();
-//     float temperature = 25;
-//     float humidity = 55;
-// switch (status)
-// {
-//   case DHT20_OK:
-//   Serial.println("OK");
-//   // String payload = "{\"temperature\": " + String(temperature) +
-//   //                  ", \"humidity\": " + String(humidity) + "}";
-//   // thingsBoard.
-// if(thingsBoard.sendTelemetryData("temperature", temperature)){
-//   Serial.println("Send data success");
-// }
-//   // thingsBoard.sendTelemetryData("humidity", humidity);
-//   break;
-// case DHT20_ERROR_CHECKSUM:
-//   Serial.println("Checksum error");
-//   break;
-// case DHT20_ERROR_CONNECT:
-//   Serial.println("Connect error");
-//   break;
-// case DHT20_MISSING_BYTES:
-//   Serial.println("Missing bytes");
-//   break;
-// case DHT20_ERROR_BYTES_ALL_ZERO:
-//   Serial.println("All bytes read zero");
-//   break;
-// case DHT20_ERROR_READ_TIMEOUT:
-//   Serial.println("Read time out");
-//   break;
-// case DHT20_ERROR_LASTREAD:
-//   Serial.println("Read too fast");
-//   break;
-// default:
-//   Serial.println("Unknown error");
-//   break;
-// }
-//     if (isnan(temperature) || isnan(humidity)) {
-//       Serial.println("Failed to read from DHT20 sensor!");
-//     } else {
-//       Serial.print("Temperature: ");
-//       Serial.print(temperature);
-//       Serial.print(" °C, Humidity: ");
-//       Serial.print(humidity);
-//       Serial.println(" %");
-//     }
-//     vTaskDelay(2000 / portTICK_PERIOD_MS);
-//   }
-// }
-
 void taskReadSensor(void *pvParameters)
 {
   while (1)
   {
-    float temperature = 100;
-    // float temperature = dht.readTemperature();
+    float temperature = dht.readTemperature();
     float humidity = dht.readHumidity();
 
     if (isnan(temperature) || isnan(humidity))
@@ -256,16 +283,18 @@ void setup()
 {
   Serial.begin(115200);
   pinMode(LEDPIN, OUTPUT);
-  // Wire.begin();
-  // dht20.begin();
+
+  delay(2000);
   dht.begin();
   initWifi();
+  readVersion();
   delay(2000);
+
   xTaskCreate(taskReconnectWifi, "reconnectWifi", 4096, NULL, 1, NULL);
   xTaskCreate(taskConnectCoreIoT, "connectCoreIoT", 4096, NULL, 1, NULL);
   xTaskCreate(taskSubSharedAttr, "subSharedAttr", 2048, NULL, 1, NULL);
-  xTaskCreate(taskSubRPCCallback, "taskSubRPCCallback", 2048, NULL, 1, NULL);
-  xTaskCreate(taskReadSensor, "readSensor", 2048, NULL, 1, NULL);
+  // xTaskCreate(taskSubRPCCallback, "taskSubRPCCallback", 2048, NULL, 1, NULL);
+  // xTaskCreate(taskReadSensor, "readSensor", 2048, NULL, 1, NULL);
 }
 
 void loop()
@@ -273,6 +302,8 @@ void loop()
   thingsBoard.loop();
   delay(1000);
 }
+
+/* -----------------------------------------CALLBACK FUNCTION-------------------------------------------------- */
 
 bool turnOn = false;
 void processSharedAttributeUpdate(const JsonObjectConst &data)
@@ -285,15 +316,16 @@ void processSharedAttributeUpdate(const JsonObjectConst &data)
       turnOn = it->value().as<bool>();
       digitalWrite(LEDPIN, turnOn);
 
-      const size_t jsonSize = Helper::Measure_Json(data);
-      char buffer[jsonSize];
-      serializeJson(data, buffer, jsonSize);
-      Serial.println(buffer);
-
       if (turnOn)
         Serial.println("turn on the led");
       else
         Serial.println("turn off the led");
+    }
+
+    if (strcmp(it->key().c_str(), fwVersion) == 0)
+    {
+      strncpy(LASTEST_FIRMWARE_VERSION, it->value().as<String>().c_str(), sizeof(LASTEST_FIRMWARE_VERSION));
+      LASTEST_FIRMWARE_VERSION[strlen(LASTEST_FIRMWARE_VERSION) + 1] = '\0';
     }
   }
 }
@@ -307,11 +339,28 @@ void processGetValidationVal(const JsonVariantConst &data, JsonDocument &respons
   else
     Serial.println("DHT20 data is valid");
 
-  // const size_t jsonSize = Helper::Measure_Json(data);
-  // char buffer[jsonSize];
-  // serializeJson(data, buffer, jsonSize);
-  // Serial.println(buffer);
-  // Ensure to only pass values do not store by copy, or if they do increase the MaxRPC
-  // template parameter accordingly to ensure that the value can be deserialized.RPC_Callback.
   response["isValid"] = isValid;
+}
+
+void update_starting_callback()
+{
+  // Nothing to do
+}
+
+void finished_callback(const bool &success)
+{
+  if (success)
+  {
+    Serial.println("Done, Reboot now");
+    writeVersion();
+    delay(2000);
+    esp_restart();
+    return;
+  }
+  Serial.println("Downloading firmware failed");
+}
+
+void progress_callback(const size_t &current, const size_t &total)
+{
+  Serial.printf("Progress %.2f%%\n", static_cast<float>(current * 100U) / total);
 }
