@@ -22,6 +22,8 @@ DHT dht(DHTPIN, DHTTYPE);
 // use to connect wifi
 const char WIFI_SSID[] = "Cutom 2.4Ghz";
 const char WIFI_PASSWORD[] = "Cutom0104";
+// const char WIFI_SSID[] = "ACLAB";
+// const char WIFI_PASSWORD[] = "ACLAB2023";
 // const char WIFI_SSID[] = "Hoang";
 // const char WIFI_PASSWORD[] = "15220903";
 
@@ -185,7 +187,15 @@ void taskConnectCoreIoT(void *pvParameters)
       Serial.println("Firwmare Update");
       Serial.print("Current Firmware Version: ");
       Serial.println(CURRENT_FIRMWARE_VERSION);
-      const OTA_Update_Callback callback(CURRENT_FIRMWARE_TITLE, CURRENT_FIRMWARE_VERSION, &updater, &finished_callback, &progress_callback, &update_starting_callback, FIRMWARE_FAILURE_RETRIES, FIRMWARE_PACKET_SIZE);
+      const OTA_Update_Callback callback(
+          CURRENT_FIRMWARE_TITLE,
+          CURRENT_FIRMWARE_VERSION,
+          &updater,
+          &finished_callback,
+          &progress_callback,
+          &update_starting_callback,
+          FIRMWARE_FAILURE_RETRIES,
+          FIRMWARE_PACKET_SIZE);
       updateRequestSent = ota.Start_Firmware_Update(callback);
     }
     vTaskDelay(8000 / portTICK_PERIOD_MS);
@@ -287,6 +297,9 @@ void setup()
   delay(2000);
   dht.begin();
   initWifi();
+  // prefs.begin("firmware", false); // false = read+write
+  // prefs.putString("version", "1");
+  // prefs.end();
   readVersion();
   delay(2000);
 
@@ -326,6 +339,7 @@ void processSharedAttributeUpdate(const JsonObjectConst &data)
     {
       strncpy(LASTEST_FIRMWARE_VERSION, it->value().as<String>().c_str(), sizeof(LASTEST_FIRMWARE_VERSION));
       LASTEST_FIRMWARE_VERSION[strlen(LASTEST_FIRMWARE_VERSION) + 1] = '\0';
+      writeVersion();
     }
   }
 }
@@ -352,8 +366,6 @@ void finished_callback(const bool &success)
   if (success)
   {
     Serial.println("Done, Reboot now");
-    writeVersion();
-    delay(2000);
     esp_restart();
     return;
   }
